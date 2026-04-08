@@ -1,58 +1,64 @@
 #Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-    Installs 7-Zip and Sublime Text, then disables Windows Smart App Control.
-
-.DESCRIPTION
-    - Downloads and installs 7-Zip (latest MSI)
-    - Downloads and installs Sublime Text 4 (latest)
-    - Disables Smart App Control via the registry
-
+    Installs 7-Zip and Sublime Text 4, then disables Windows Smart App Control.
 .NOTES
-    Must be run as Administrator.
+    Run as Administrator:
+        Set-ExecutionPolicy Bypass -Scope Process -Force
+        .\setup.ps1
 #>
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
-function Write-Step  { param($msg) Write-Host "`n==> $msg" -ForegroundColor Cyan }
-function Write-OK    { param($msg) Write-Host "    [OK] $msg" -ForegroundColor Green }
-function Write-Fail  { param($msg) Write-Host "    [!!] $msg" -ForegroundColor Red }
+function Write-Step { param($msg) Write-Host "`n==> $msg" -ForegroundColor Cyan   }
+function Write-OK   { param($msg) Write-Host "    [OK] $msg" -ForegroundColor Green  }
+function Write-Warn { param($msg) Write-Host "    [~]  $msg" -ForegroundColor Yellow }
+function Write-Fail { param($msg) Write-Host "    [!!] $msg" -ForegroundColor Red    }
 
-function Install-FromUrl {
+# NOTE: Do NOT name the args parameter $Args — that is a reserved PowerShell variable.
+function Install-Exe {
     param(
-        [string]$Name,
-        [string]$Url,
-        [string]$OutFile,
-        [string[]]$Args
+        [string]   $AppName,
+        [string]   $Url,
+        [string]   $Dest,
+        [string[]] $SilentArgs
     )
 
-    Write-Step "Downloading $Name..."
+    Write-Step "Downloading $AppName..."
     try {
-        Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing
-        Write-OK "Downloaded to $OutFile"
+        Invoke-WebRequest -Uri $Url -OutFile $Dest -UseBasicParsing
+        Write-OK "Saved to $Dest"
     } catch {
-        Write-Fail "Failed to download $Name`: $_"
-        return $false
+        Write-Fail "Download failed: $_"
+        return
     }
 
-    Write-Step "Installing $Name..."
+    Write-Step "Installing $AppName..."
     try {
-        $proc = Start-Process -FilePath $OutFile -ArgumentList $Args -Wait -PassThru
-        if ($proc.ExitCode -ne 0) {
-            Write-Fail "$Name installer exited with code $($proc.ExitCode)"
-            return $false
+        # Choose the right host process for MSI vs EXE
+        if ($Dest -match '\.msi$') {
+            $proc = Start-Process -FilePath "msiexec.exe" `
+                                  -ArgumentList (@("/i", "`"$Dest`"") + $SilentArgs) `
+                                  -Wait -PassThru
+        } else {
+            $proc = Start-Process -FilePath $Dest `
+                                  -ArgumentList $SilentArgs `
+                                  -Wait -PassThru
         }
-        Write-OK "$Name installed successfully."
+
+        if ($proc.ExitCode -eq 0) {
+            Write-OK "$AppName installed successfully."
+        } else {
+            Write-Fail "$AppName exited with code $($proc.ExitCode)"
+        }
     } catch {
-        Write-Fail "Failed to install $Name`: $_"
-        return $false
+        Write-Fail "Install failed: $_"
     }
 
-    Remove-Item -Path $OutFile -Force -ErrorAction SilentlyContinue
-    return $true
+    Remove-Item -Path $Dest -Force -ErrorAction SilentlyContinue
 }
 
 # ── Temp folder ───────────────────────────────────────────────────────────────
@@ -60,79 +66,89 @@ function Install-FromUrl {
 $tmp = Join-Path $env:TEMP "AppInstalls_$(Get-Random)"
 New-Item -ItemType Directory -Path $tmp -Force | Out-Null
 
-# ── 1. 7-Zip ──────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. 7-Zip  —  resolve via GitHub Releases API (always accurate, no scraping)
+# ─────────────────────────────────────────────────────────────────────────────
 
-Write-Step "Resolving latest 7-Zip MSI..."
+Write-Step "Resolving latest 7-Zip version from GitHub..."
+
+$sevenZipUrl = $null
 try {
-    # Scrape the official 7-zip download page to find the current x64 MSI link
-    $page    = Invoke-WebRequest -Uri "https://www.7-zip.org/download.html" -UseBasicParsing
-    $msiLink = ($page.Links | Where-Object { $_.href -match '7z\d+-x64\.msi$' } | Select-Object -First 1).href
-    if (-not $msiLink) { throw "Could not locate MSI link on 7-zip.org" }
-    $sevenZipUrl = "https://www.7-zip.org/$msiLink"
-    Write-OK "Found: $sevenZipUrl"
+    $release = Invoke-RestMethod `
+        -Uri "https://api.github.com/repos/ip7z/7zip/releases/latest" `
+        -UseBasicParsing
+    $asset = $release.assets | Where-Object { $_.name -match 'x64\.msi$' } | Select-Object -First 1
+    if ($asset) {
+        $sevenZipUrl = $asset.browser_download_url
+        Write-OK "Latest release: $($release.tag_name)  ->  $sevenZipUrl"
+    }
 } catch {
-    # Fallback to a pinned recent version
-    Write-Host "    [~] Falling back to pinned 7-Zip 24.09 URL" -ForegroundColor Yellow
-    $sevenZipUrl = "https://www.7-zip.org/a/7z2409-x64.msi"
+    Write-Warn "GitHub API failed: $_"
 }
 
-$sevenZipMsi = Join-Path $tmp "7zip-x64.msi"
-Install-FromUrl -Name "7-Zip" `
-                -Url $sevenZipUrl `
-                -OutFile $sevenZipMsi `
-                -Args @("/i", $sevenZipMsi, "/qn", "/norestart")
-
-# ── 2. Sublime Text 4 ─────────────────────────────────────────────────────────
-
-# Sublime Text's stable Windows x64 installer URL (always points to latest build)
-$sublimeUrl = "https://download.sublimetext.com/sublime_text_build_4180_x64_setup.exe"
-Write-Step "Resolving latest Sublime Text build..."
-try {
-    # Follow the redirect from the 'latest' alias
-    $resp = Invoke-WebRequest -Uri "https://www.sublimetext.com/download_thanks?target=win-x64" `
-                              -UseBasicParsing -MaximumRedirection 5
-    $dlLink = ($resp.Links | Where-Object { $_.href -match 'sublime_text.*x64.*\.exe' } | Select-Object -First 1).href
-    if ($dlLink) { $sublimeUrl = $dlLink; Write-OK "Found: $sublimeUrl" }
-    else         { Write-Host "    [~] Using pinned Sublime Text URL" -ForegroundColor Yellow }
-} catch {
-    Write-Host "    [~] Using pinned Sublime Text URL" -ForegroundColor Yellow
+if (-not $sevenZipUrl) {
+    $sevenZipUrl = "https://github.com/ip7z/7zip/releases/download/26.00/7z2600-x64.msi"
+    Write-Warn "Using pinned fallback: $sevenZipUrl"
 }
 
-$sublimeExe = Join-Path $tmp "SublimeTextSetup.exe"
-Install-FromUrl -Name "Sublime Text 4" `
-                -Url $sublimeUrl `
-                -OutFile $sublimeExe `
-                -Args @("/VERYSILENT", "/NORESTART", "/SUPPRESSMSGBOXES")
+Install-Exe -AppName "7-Zip" `
+            -Url $sevenZipUrl `
+            -Dest (Join-Path $tmp "7zip-x64.msi") `
+            -SilentArgs @("/qn", "/norestart")
 
-# ── 3. Disable Smart App Control ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. Sublime Text 4  —  resolve via official update-check feed
+# ─────────────────────────────────────────────────────────────────────────────
+
+Write-Step "Resolving latest Sublime Text 4 build..."
+
+$sublimeUrl = $null
+try {
+    $feed = Invoke-RestMethod `
+        -Uri "https://www.sublimetext.com/updates/4/stable_update_check?platform=windows&version=1" `
+        -UseBasicParsing
+    if ($feed.url) {
+        $sublimeUrl = $feed.url
+        Write-OK "Found: $sublimeUrl"
+    }
+} catch {
+    Write-Warn "Sublime update feed failed: $_"
+}
+
+if (-not $sublimeUrl) {
+    $sublimeUrl = "https://download.sublimetext.com/sublime_text_build_4200_x64_setup.exe"
+    Write-Warn "Using pinned fallback: $sublimeUrl"
+}
+
+Install-Exe -AppName "Sublime Text 4" `
+            -Url $sublimeUrl `
+            -Dest (Join-Path $tmp "SublimeTextSetup.exe") `
+            -SilentArgs @("/VERYSILENT", "/NORESTART", "/SUPPRESSMSGBOXES")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. Disable Smart App Control
+# ─────────────────────────────────────────────────────────────────────────────
 
 Write-Step "Disabling Smart App Control..."
 try {
     $sacKey = "HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy"
 
-    # VerifiedAndReputablePolicyState values:
-    #   0 = Off  |  1 = Evaluation  |  2 = On
     if (-not (Test-Path $sacKey)) {
         New-Item -Path $sacKey -Force | Out-Null
     }
 
-    Set-ItemProperty -Path $sacKey -Name "VerifiedAndReputablePolicyState" -Value 0 -Type DWord -Force
-    Write-OK "Smart App Control set to OFF (registry key updated)."
-
-    # Also stamp the 'was-turned-off-manually' flag so Windows doesn't re-enable it
-    $sacFlag = "HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy"
-    Set-ItemProperty -Path $sacFlag -Name "VerifiedAndReputablePolicyStateMinValueSeen" -Value 0 -Type DWord -Force
-    Write-OK "SAC minimum-seen state flag cleared."
+    # 0 = Off | 1 = Evaluation | 2 = On
+    Set-ItemProperty -Path $sacKey -Name "VerifiedAndReputablePolicyState"             -Value 0 -Type DWord -Force
+    Set-ItemProperty -Path $sacKey -Name "VerifiedAndReputablePolicyStateMinValueSeen" -Value 0 -Type DWord -Force
+    Write-OK "Smart App Control set to OFF."
 } catch {
-    Write-Fail "Could not update Smart App Control registry: $_"
+    Write-Fail "Registry update failed: $_"
 }
 
-# ── Done ──────────────────────────────────────────────────────────────────────
+# ── Cleanup & summary ─────────────────────────────────────────────────────────
 
 Remove-Item -Path $tmp -Recurse -Force -ErrorAction SilentlyContinue
 
 Write-Host "`n========================================" -ForegroundColor Cyan
-Write-Host "  All tasks completed." -ForegroundColor Cyan
-Write-Host "  A reboot is recommended for SAC changes" -ForegroundColor Cyan
-Write-Host "  to take full effect." -ForegroundColor Cyan
-Write-Host "========================================`n" -ForegroundColor Cyan
+Write-Host "  Done! Reboot to fully apply SAC change." -ForegroundColor Cyan
+Write-Host "========================================`n"  -ForegroundColor Cyan
